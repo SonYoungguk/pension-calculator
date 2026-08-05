@@ -213,6 +213,48 @@ function Field({ label, children, hint }: { label: string; children: React.React
 const inputCls =
   'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200'
 
+/**
+ * 연·월 드롭다운. Safari는 <input type="month">를 지원하지 않아 자유 입력 텍스트로
+ * 바뀌므로(형식 불일치로 계산 불가) 브라우저와 무관하게 동작하는 select를 쓴다.
+ * value는 'YYYY-MM' (미완성이면 'YYYY-' / '-MM' / '').
+ */
+function YearMonthField({
+  value,
+  onChange,
+  yearFrom,
+  yearTo,
+}: {
+  value: string
+  onChange: (v: string) => void
+  yearFrom: number
+  yearTo: number
+}) {
+  const [y = '', m = ''] = value.split('-')
+  const years: number[] = []
+  for (let yy = yearTo; yy >= yearFrom; yy--) years.push(yy)
+  const update = (ny: string, nm: string) => onChange(ny || nm ? `${ny}-${nm}` : '')
+  return (
+    <div className="grid grid-cols-[3fr_2fr] gap-2">
+      <select className={inputCls} value={y} onChange={(e) => update(e.target.value, m)}>
+        <option value="">연도</option>
+        {years.map((yy) => (
+          <option key={yy} value={String(yy)}>
+            {yy}년
+          </option>
+        ))}
+      </select>
+      <select className={inputCls} value={m} onChange={(e) => update(y, e.target.value)}>
+        <option value="">월</option>
+        {Array.from({ length: 12 }, (_, i) => String(i + 1).padStart(2, '0')).map((mm) => (
+          <option key={mm} value={mm}>
+            {Number(mm)}월
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
 function InputPanel({
   f,
   set,
@@ -230,20 +272,25 @@ function InputPanel({
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="출생연도">
-          <input
+          <select
             className={inputCls}
-            inputMode="numeric"
-            placeholder="1990"
             value={birthYear}
-            onChange={(e) => setBirthYear(e.target.value.replace(/\D/g, '').slice(0, 4))}
-          />
+            onChange={(e) => setBirthYear(e.target.value)}
+          >
+            <option value="">선택</option>
+            {Array.from({ length: 2005 - 1950 + 1 }, (_, i) => 2005 - i).map((y) => (
+              <option key={y} value={String(y)}>
+                {y}년
+              </option>
+            ))}
+          </select>
         </Field>
         <div />
         <Field label="임용 연월">
-          <input type="month" className={inputCls} min="2010-01" value={f.hire} onChange={(e) => set({ hire: e.target.value })} />
+          <YearMonthField value={f.hire} onChange={(v) => set({ hire: v })} yearFrom={2010} yearTo={2035} />
         </Field>
         <Field label="퇴직예정 연월">
-          <input type="month" className={inputCls} value={f.retire} onChange={(e) => set({ retire: e.target.value })} />
+          <YearMonthField value={f.retire} onChange={(v) => set({ retire: v })} yearFrom={2017} yearTo={2070} />
         </Field>
       </div>
 
@@ -287,10 +334,10 @@ function InputPanel({
         {f.hasMilitary && (
           <div className="mt-3 grid grid-cols-2 gap-3">
             <Field label="복무 시작">
-              <input type="month" className={inputCls} value={f.militaryFrom} onChange={(e) => set({ militaryFrom: e.target.value })} />
+              <YearMonthField value={f.militaryFrom} onChange={(v) => set({ militaryFrom: v })} yearFrom={1990} yearTo={2030} />
             </Field>
             <Field label="복무 종료">
-              <input type="month" className={inputCls} value={f.militaryTo} onChange={(e) => set({ militaryTo: e.target.value })} />
+              <YearMonthField value={f.militaryTo} onChange={(v) => set({ militaryTo: v })} yearFrom={1990} yearTo={2030} />
             </Field>
             <p className="col-span-2 text-xs text-amber-700">
               군복무 산입분의 소득 취급은 법령 문언만으로 확정되지 않습니다. 결과에 추정 범위를 함께
