@@ -1,0 +1,554 @@
+import { useMemo, useState } from 'react'
+import averageIncome from './data/averageIncome.json'
+import { calculate } from './engine/calculator'
+import { INCOME_CAP_MULTIPLE, accrualRatePct } from './engine/constants'
+import { REDISTRIBUTION_BRACKETS } from './engine/constants'
+import { retirementLumpSum, severanceAllowance } from './engine/severance'
+import type { PensionInput, PensionResult, YM } from './engine/types'
+import { DEFAULT_ASSUMPTIONS } from './engine/types'
+
+const AVG = averageIncome as Record<string, number>
+const BASE_YEAR = 2026
+const INCOME_CAP = AVG[BASE_YEAR] * INCOME_CAP_MULTIPLE
+
+const won = new Intl.NumberFormat('ko-KR')
+const fmtWon = (v: number) => `${won.format(Math.round(v))}원`
+const pct = (v: number, digits = 2) => `${(v * 100).toFixed(digits)}%`
+
+function parseYM(s: string): YM | null {
+  const m = /^(\d{4})-(\d{2})$/.exec(s)
+  if (!m) return null
+  return [Number(m[1]), Number(m[2])]
+}
+
+interface FormState {
+  hire: string
+  retire: string
+  baseIncome: string
+  hasMilitary: boolean
+  militaryFrom: string
+  militaryTo: string
+  earlyPension: boolean
+  salaryGrowth: string
+  cpi: string
+  gradeStep: string
+  avgIncomeGrowth: string
+}
+
+const INITIAL: FormState = {
+  hire: '',
+  retire: '',
+  baseIncome: '',
+  hasMilitary: false,
+  militaryFrom: '',
+  militaryTo: '',
+  earlyPension: false,
+  salaryGrowth: (DEFAULT_ASSUMPTIONS.salaryGrowth * 100).toString(),
+  cpi: (DEFAULT_ASSUMPTIONS.cpi * 100).toString(),
+  gradeStep: (DEFAULT_ASSUMPTIONS.gradeStep * 100).toString(),
+  avgIncomeGrowth: (DEFAULT_ASSUMPTIONS.avgIncomeGrowth * 100).toString(),
+}
+
+type Built =
+  | { ok: true; input: PensionInput; incomeClamped: boolean }
+  | { ok: false; errors: string[] }
+
+function buildInput(f: FormState): Built {
+  const errors: string[] = []
+  const hire = parseYM(f.hire)
+  const retire = parseYM(f.retire)
+  const rawIncome = Number(f.baseIncome.replaceAll(',', ''))
+
+  if (!hire) errors.push('임용 연월을 입력하세요.')
+  if (!retire) errors.push('퇴직예정 연월을 입력하세요.')
+  if (!f.baseIncome || !Number.isFinite(rawIncome) || rawIncome <= 0)
+    errors.push('기준소득월액을 입력하세요.')
+
+  if (hire && hire[0] < 2010)
+    errors.push('2009년 이전 임용자는 지원하지 않습니다(평균보수월액 자료 필요 — 공단에 문의하세요).')
+  if (hire && retire && (retire[0] - hire[0]) * 12 + (retire[1] - hire[1]) < 0)
+    errors.push('퇴직예정일이 임용일보다 빠릅니다.')
+  if (retire && retire[0] < 2017) errors.push('2017년 이후 퇴직만 지원합니다.')
+
+  let military: readonly [YM, YM] | null = null
+  if (f.hasMilitary) {
+    const from = parseYM(f.militaryFrom)
+    const to = parseYM(f.militaryTo)
+    if (!from || !to) errors.push('군복무 기간을 입력하세요.')
+    else if ((to[0] - from[0]) * 12 + (to[1] - from[1]) < 0) errors.push('군복무 기간이 올바르지 않습니다.')
+    else if (hire && (to[0] - hire[0]) * 12 + (to[1] - hire[1]) >= 0)
+      errors.push('군복무 산입기간은 임용 전 기간이어야 합니다.')
+    else military = [from, to]
+  }
+
+  if (errors.length) return { ok: false, errors }
+
+  const incomeClamped = rawIncome > INCOME_CAP
+  return {
+    ok: true,
+    incomeClamped,
+    input: {
+      birthYear: 0, // 출생연도는 아래에서 채운다
+      hire: hire!,
+      retire: retire!,
+      baseIncome: Math.min(rawIncome, INCOME_CAP),
+      baseYear: BASE_YEAR,
+      military,
+      includeP1Income: true,
+      includeMilitaryInAvg: true,
+      earlyPension: f.earlyPension,
+      assumptions: {
+        salaryGrowth: Number(f.salaryGrowth) / 100,
+        cpi: Number(f.cpi) / 100,
+        gradeStep: Number(f.gradeStep) / 100,
+        avgIncomeGrowth: Number(f.avgIncomeGrowth) / 100,
+      },
+    },
+  }
+}
+
+/** B/A가 소득재분배 구간 경계에 가까우면 해당 경계를 돌려준다 (스펙 §3.5) */
+function nearBracketEdge(ratio: number): number | null {
+  for (const [threshold] of REDISTRIBUTION_BRACKETS) {
+    if (threshold > 2 || threshold <= 0.3) continue
+    if (Math.abs(ratio - threshold) <= 0.02) return threshold
+  }
+  return null
+}
+
+export default function App() {
+  const [f, setF] = useState<FormState>(INITIAL)
+  const [birthYear, setBirthYear] = useState('')
+  const set = (patch: Partial<FormState>) => setF((prev) => ({ ...prev, ...patch }))
+
+  const built = useMemo(() => {
+    const b = buildInput(f)
+    if (!b.ok) return b
+    const by = Number(birthYear)
+    if (!/^\d{4}$/.test(birthYear) || by < 1940 || by > 2010)
+      return { ok: false as const, errors: ['출생연도(4자리)를 입력하세요.'] }
+    return { ...b, input: { ...b.input, birthYear: by } }
+  }, [f, birthYear])
+
+  type Results =
+    | { kind: 'ok'; main: PensionResult; range: { min: number; max: number } | null }
+    | { kind: 'err'; error: string }
+    | null
+  const results = useMemo((): Results => {
+    if (!built.ok) return null
+    try {
+      const main = calculate(built.input)
+      // ★법령 미확정 옵션 2가지의 조합 범위 (군복무가 있을 때만 의미 있음)
+      let range: { min: number; max: number } | null = null
+      if (built.input.military) {
+        const amounts = [true, false].flatMap((a) =>
+          [true, false].map(
+            (b) => calculate({ ...built.input, includeP1Income: a, includeMilitaryInAvg: b }).monthlyPension,
+          ),
+        )
+        range = { min: Math.min(...amounts), max: Math.max(...amounts) }
+      }
+      return { kind: 'ok', main, range }
+    } catch (e) {
+      return { kind: 'err', error: e instanceof Error ? e.message : String(e) }
+    }
+  }, [built])
+
+  return (
+    <div className="min-h-screen bg-slate-100 text-slate-900">
+      <div className="mx-auto max-w-5xl px-4 py-8">
+        <header className="mb-6">
+          <h1 className="text-2xl font-bold">공무원연금 계산기</h1>
+          <p className="mt-1 text-sm text-slate-600">
+            2010년 이후 임용자 대상 · 공무원연금법(법률 제21065호)·시행령(제35948호) 기준 · 모든 계산은
+            브라우저 안에서만 수행됩니다
+          </p>
+        </header>
+
+        <div className="grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+          <InputPanel f={f} set={set} birthYear={birthYear} setBirthYear={setBirthYear} />
+          <div>
+            {!built.ok && (
+              <div className="rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500">
+                <p className="mb-2 font-medium text-slate-700">입력을 완성하면 결과가 표시됩니다.</p>
+                <ul className="list-inside list-disc space-y-1">
+                  {built.errors.map((e) => (
+                    <li key={e}>{e}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {built.ok && results?.kind === 'err' && (
+              <div className="rounded-xl border border-red-200 bg-red-50 p-6 text-sm text-red-700">
+                계산할 수 없습니다: {results.error}
+              </div>
+            )}
+            {built.ok && results?.kind === 'ok' && (
+              <ResultPanel
+                r={results.main}
+                range={results.range}
+                input={built.input}
+                incomeClamped={built.incomeClamped}
+              />
+            )}
+          </div>
+        </div>
+
+        <NoticeFooter />
+      </div>
+    </div>
+  )
+}
+
+function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-sm font-medium text-slate-700">{label}</span>
+      {children}
+      {hint && <span className="mt-1 block text-xs text-slate-500">{hint}</span>}
+    </label>
+  )
+}
+
+const inputCls =
+  'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200'
+
+function InputPanel({
+  f,
+  set,
+  birthYear,
+  setBirthYear,
+}: {
+  f: FormState
+  set: (p: Partial<FormState>) => void
+  birthYear: string
+  setBirthYear: (v: string) => void
+}) {
+  return (
+    <section className="space-y-4 self-start rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h2 className="text-lg font-semibold">입력</h2>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="출생연도">
+          <input
+            className={inputCls}
+            inputMode="numeric"
+            placeholder="1990"
+            value={birthYear}
+            onChange={(e) => setBirthYear(e.target.value.replace(/\D/g, '').slice(0, 4))}
+          />
+        </Field>
+        <div />
+        <Field label="임용 연월">
+          <input type="month" className={inputCls} min="2010-01" value={f.hire} onChange={(e) => set({ hire: e.target.value })} />
+        </Field>
+        <Field label="퇴직예정 연월">
+          <input type="month" className={inputCls} value={f.retire} onChange={(e) => set({ retire: e.target.value })} />
+        </Field>
+      </div>
+
+      <fieldset className="rounded-lg border border-slate-200 p-3">
+        <legend className="px-1 text-sm font-medium text-slate-700">소득 입력 방식</legend>
+        <label className="flex items-start gap-2 text-sm">
+          <input type="radio" checked readOnly className="mt-0.5" />
+          <span>
+            기준소득월액 직접 입력 <span className="text-slate-500">(권장)</span>
+            <span className="mt-0.5 block text-xs text-slate-500">
+              공무원연금공단 <b>연금복지포털</b>에서 본인 기준소득월액을 확인할 수 있습니다
+            </span>
+          </span>
+        </label>
+        <label className="mt-2 flex items-start gap-2 text-sm text-slate-400">
+          <input type="radio" disabled className="mt-0.5" />
+          <span>직급·호봉 기반 추정 (준비 중)</span>
+        </label>
+        <div className="mt-3">
+          <Field label={`기준소득월액 (${BASE_YEAR}년, 원)`} hint={`상한: 전체 공무원 평균액의 1.6배 = ${won.format(INCOME_CAP)}원`}>
+            <input
+              className={inputCls}
+              inputMode="numeric"
+              placeholder="4,300,000"
+              value={f.baseIncome}
+              onChange={(e) => set({ baseIncome: e.target.value.replace(/[^\d,]/g, '') })}
+            />
+          </Field>
+        </div>
+      </fieldset>
+
+      <fieldset className="rounded-lg border border-slate-200 p-3">
+        <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+          <input
+            type="checkbox"
+            checked={f.hasMilitary}
+            onChange={(e) => set({ hasMilitary: e.target.checked })}
+          />
+          군복무 기간 산입 (임용 전 복무)
+        </label>
+        {f.hasMilitary && (
+          <div className="mt-3 grid grid-cols-2 gap-3">
+            <Field label="복무 시작">
+              <input type="month" className={inputCls} value={f.militaryFrom} onChange={(e) => set({ militaryFrom: e.target.value })} />
+            </Field>
+            <Field label="복무 종료">
+              <input type="month" className={inputCls} value={f.militaryTo} onChange={(e) => set({ militaryTo: e.target.value })} />
+            </Field>
+            <p className="col-span-2 text-xs text-amber-700">
+              군복무 산입분의 소득 취급은 법령 문언만으로 확정되지 않습니다. 결과에 추정 범위를 함께
+              표시하며, 정확한 값은 공단(1588-4321) 확인이 필요합니다.
+            </p>
+          </div>
+        )}
+      </fieldset>
+
+      <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+        <input
+          type="checkbox"
+          checked={f.earlyPension}
+          onChange={(e) => set({ earlyPension: e.target.checked })}
+        />
+        조기퇴직연금 선택 (개시연령 전 감액 수령)
+      </label>
+
+      <details className="rounded-lg border border-slate-200 p-3">
+        <summary className="cursor-pointer text-sm font-medium text-slate-700">
+          미래 가정값 조정 <span className="font-normal text-slate-500">(기본값: 최근 실적 평균)</span>
+        </summary>
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          {(
+            [
+              ['salaryGrowth', '공무원보수인상률 (%/년)'],
+              ['cpi', '물가변동률 (%/년)'],
+              ['gradeStep', '호봉승급 기여 (%/년)'],
+              ['avgIncomeGrowth', '전체 평균액 인상률 (%/년)'],
+            ] as const
+          ).map(([key, label]) => (
+            <Field key={key} label={label}>
+              <input
+                type="number"
+                step="0.1"
+                className={inputCls}
+                value={f[key]}
+                onChange={(e) => set({ [key]: e.target.value })}
+              />
+            </Field>
+          ))}
+          <p className="col-span-2 text-xs text-slate-500">
+            미래 보수·물가는 알 수 없으므로 가정입니다. 값을 바꿔 결과가 얼마나 달라지는지 확인해
+            보세요.
+          </p>
+        </div>
+      </details>
+    </section>
+  )
+}
+
+function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-lg bg-slate-50 p-3">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="mt-0.5 font-semibold">{value}</div>
+      {sub && <div className="mt-0.5 text-xs text-slate-500">{sub}</div>}
+    </div>
+  )
+}
+
+function ResultPanel({
+  r,
+  range,
+  input,
+  incomeClamped,
+}: {
+  r: PensionResult
+  range: { min: number; max: number } | null
+  input: PensionInput
+  incomeClamped: boolean
+}) {
+  const lumpSumPath = r.service.total < 10
+  const severance = severanceAllowance(
+    r.finalIncomeAtRetirement,
+    ((input.retire[0] - input.hire[0]) * 12 + (input.retire[1] - input.hire[1]) + 1) / 12,
+  )
+  const edge = nearBracketEdge(r.incomeRatio)
+  const p3Years: number[] = []
+  for (let y = Math.max(2016, input.hire[0]); y <= input.retire[0]; y++) p3Years.push(y)
+
+  return (
+    <section className="space-y-4">
+      {incomeClamped && (
+        <Callout tone="amber">
+          입력한 기준소득월액이 법정 상한을 넘어 상한값으로 계산했습니다 (법 제30조제2항제2호).
+        </Callout>
+      )}
+
+      {lumpSumPath ? (
+        <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <h2 className="text-lg font-semibold">재직 10년 미만 — 퇴직일시금 대상</h2>
+          <p className="mt-1 text-sm text-slate-600">
+            퇴직연금은 10년 이상 재직해야 받을 수 있습니다 (법 제43조제1항).
+          </p>
+          <p className="mt-4 text-3xl font-bold">
+            {fmtWon(retirementLumpSum(r.finalIncomeAtRetirement, r.service.total))}
+          </p>
+          <p className="mt-1 text-sm text-slate-500">
+            퇴직일시금 추정액 (재직 {r.service.total.toFixed(2)}년) · 산정액이 기여금+민법 소정 이자보다
+            적으면 후자를 지급합니다
+          </p>
+          <div className="mt-4 border-t border-slate-100 pt-4">
+            <Stat label="퇴직수당 (별도 지급)" value={fmtWon(severance)} sub="퇴직 시점 명목 금액" />
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="text-lg font-semibold">최초 월 연금액 (추정)</h2>
+              <span className="text-xs text-slate-500">
+                {r.startYear}년(만 {r.startAge}세) 개시 시점 금액
+              </span>
+            </div>
+            <p className="mt-3 text-4xl font-bold tracking-tight">{fmtWon(r.monthlyPension)}</p>
+            <p className="mt-1 text-sm text-slate-500">
+              {input.baseYear}년 구매력으로 약 {fmtWon(r.realValueAtBaseYear)}
+            </p>
+            {range && (range.max - range.min > 1 || null) && (
+              <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                군복무 소득 취급(미확정 2건)에 따라 <b>{fmtWon(range.min)} ~ {fmtWon(range.max)}</b> 범위로
+                달라질 수 있습니다 — 공단 확인 필요
+              </p>
+            )}
+            {r.gapYears > 0 && (
+              <p className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700">
+                퇴직({input.retire[0]}년) 후 개시({r.startYear}년)까지 <b>무연금 {r.gapYears}년</b>이
+                발생합니다. 명예퇴직은 지급개시연령 예외에 해당하지 않습니다.
+              </p>
+            )}
+            {r.early && (
+              <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm">
+                <b>조기퇴직연금</b>: {r.early.startYear}년부터 {fmtWon(r.early.monthlyAmount)} (미달연수{' '}
+                {r.early.shortfallYears}년 → 지급률 {pct(r.early.payRate, 0)})
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h3 className="font-semibold">재직기간 구간별 내역</h3>
+            <p className="mt-0.5 text-xs text-slate-500">
+              총 재직 {r.service.total.toFixed(2)}년 (1기간 {r.service.p1.toFixed(2)} / 2기간{' '}
+              {r.service.p2.toFixed(2)} / 3기간 {r.service.p3.toFixed(2)})
+            </p>
+            <table className="mt-3 w-full text-sm">
+              <tbody className="divide-y divide-slate-100">
+                <Row
+                  name="1기간 (~2009.12)"
+                  desc="평균보수월액 × 재직연수 × 2.5%"
+                  amount={r.byPeriod.p1}
+                />
+                <Row
+                  name="2기간 (2010~2015)"
+                  desc="평균기준소득월액 × 이행률 × 재직연수 × 1.9%"
+                  amount={r.byPeriod.p2}
+                />
+                <Row
+                  name="3기간 (2016~)"
+                  desc={
+                    r.p3Detail.capApplied
+                      ? `역전 방지 상한 적용 — 소득재분배 산식(${fmtWon(r.p3Detail.redistributed)})이 종전규정(${fmtWon(r.p3Detail.oldRule)})보다 커서 종전규정 금액 지급 (부칙 제13조제4항)`
+                      : `소득재분배분 ${fmtWon(r.p3Detail.redistributionPart)} + 개인소득분 ${fmtWon(r.p3Detail.individualPart)}`
+                  }
+                  amount={r.byPeriod.p3}
+                  badge={r.p3Detail.capApplied ? '상한 적용' : undefined}
+                />
+              </tbody>
+              <tfoot>
+                <tr className="border-t border-slate-200 font-semibold">
+                  <td className="py-2">합계</td>
+                  <td className="py-2 text-right">{fmtWon(r.monthlyPension)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h3 className="font-semibold">적용된 파라미터</h3>
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <Stat label="이행률" value={pct(r.transitionRate)} sub="시행령 부칙 제10조제10항" />
+              <Stat label="본인 평균기준소득월액 (B)" value={fmtWon(r.B)} sub="개시시점 현재가치" />
+              <Stat label="전체 3년 평균 (A)" value={fmtWon(r.A)} sub="개시시점 현재가치" />
+              <Stat label="B/A (절사)" value={r.incomeRatio.toFixed(2)} />
+              <Stat label="소득재분배 적용비율" value={pct(r.redistributionRate)} sub="부칙 제13조제2항" />
+              <Stat label="퇴직수당 (별도)" value={fmtWon(severance)} sub="퇴직 시점 명목 · 산입기간 제외" />
+            </div>
+            {edge && (
+              <Callout tone="amber" className="mt-3">
+                B/A({r.incomeRatio.toFixed(2)})가 소득재분배 구간 경계({edge.toFixed(1)}) 부근입니다.
+                소득이 조금 달라지면 적용비율이 계단식으로 바뀌어 연금액이 갑자기 변할 수 있습니다.
+              </Callout>
+            )}
+            <details className="mt-3">
+              <summary className="cursor-pointer text-sm font-medium text-slate-700">
+                연도별 지급률 (재직 연도별로 각각 적용)
+              </summary>
+              <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
+                {p3Years.map((y) => (
+                  <span key={y} className="rounded bg-slate-100 px-2 py-1">
+                    {y} · {accrualRatePct(y).toFixed(3)}%
+                  </span>
+                ))}
+              </div>
+            </details>
+          </div>
+        </>
+      )}
+    </section>
+  )
+}
+
+function Row({ name, desc, amount, badge }: { name: string; desc: string; amount: number; badge?: string }) {
+  return (
+    <tr>
+      <td className="py-2 pr-4">
+        <div className="font-medium">
+          {name}
+          {badge && (
+            <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+              {badge}
+            </span>
+          )}
+        </div>
+        <div className="mt-0.5 text-xs text-slate-500">{desc}</div>
+      </td>
+      <td className="py-2 text-right align-top font-medium whitespace-nowrap">{fmtWon(amount)}</td>
+    </tr>
+  )
+}
+
+function Callout({
+  tone,
+  children,
+  className = '',
+}: {
+  tone: 'amber' | 'red'
+  children: React.ReactNode
+  className?: string
+}) {
+  const cls = tone === 'amber' ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-red-200 bg-red-50 text-red-700'
+  return <div className={`rounded-lg border px-3 py-2 text-xs ${cls} ${className}`}>{children}</div>
+}
+
+function NoticeFooter() {
+  return (
+    <footer className="mt-8 rounded-xl border border-slate-200 bg-white p-5 text-xs leading-relaxed text-slate-500">
+      <p className="font-medium text-slate-700">
+        이 결과는 추정치이며 법적 효력이 없습니다. 정확한 연금액은 공무원연금공단(☎ 1588-4321)에서
+        확인하세요.
+      </p>
+      <p className="mt-1">입력값은 브라우저를 벗어나지 않으며 어떤 서버로도 전송되지 않습니다.</p>
+      <p className="mt-2">
+        근거: 공무원연금법(법률 제21065호) 제30조·제43조·제50조·제51조·제62조·부칙(법률 제15523호)
+        제11조·제13조·제24조, 같은 법 시행령(대통령령 제35948호) 제5조·제10조·제26조·제58조·부칙(대통령령
+        제29181호) 제10조제10항. 미래 보수인상률·물가변동률은 가정값이며, 수급 개시 후 물가연동 조정은
+        최초 연금액과 별개로 매년 적용됩니다.
+      </p>
+    </footer>
+  )
+}
