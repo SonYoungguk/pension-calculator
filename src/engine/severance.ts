@@ -28,3 +28,17 @@ export function retirementLumpSum(finalMonthlyIncome: number, totalServiceYears:
   const years = Math.min(totalServiceYears, 36)
   return finalMonthlyIncome * years * (975 / 1000 + (65 / 10000) * (years - 5))
 }
+
+/**
+ * 퇴직연금공제일시금 — 법 제43조제6항.
+ * 10년을 초과하는 재직기간 중 본인이 원하는 기간(공제재직연수)만 일시금으로 받고
+ * 나머지는 연금으로 받는 절충형. 산식이 퇴직일시금과 달리 (공제재직연수 − 5)가 아니라
+ * 공제재직연수를 그대로 곱한다.
+ *
+ * @param finalMonthlyIncome 퇴직한 날의 전날이 속하는 달의 기준소득월액 (명목)
+ * @param deductedYears 일시금으로 받을 재직연수 (공제재직연수)
+ */
+export function deductedLumpSum(finalMonthlyIncome: number, deductedYears: number): number {
+  if (deductedYears <= 0) return 0
+  return finalMonthlyIncome * deductedYears * (975 / 1000 + (65 / 10000) * deductedYears)
+}

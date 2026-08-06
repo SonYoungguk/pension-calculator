@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import averageIncome from './data/averageIncome.json'
-import { calculate } from './engine/calculator'
+import { calculate, deductedOption } from './engine/calculator'
 import { INCOME_CAP_MULTIPLE, accrualRatePct } from './engine/constants'
 import { REDISTRIBUTION_BRACKETS } from './engine/constants'
 import { retirementLumpSum, severanceAllowance } from './engine/severance'
@@ -457,6 +457,12 @@ function ResultPanel({
             <p className="mt-1 text-sm text-slate-500">
               {input.baseYear}년 구매력으로 약 {fmtWon(r.realValueAtBaseYear)}
             </p>
+            {r.gapYears > 0 && (
+              <p className="mt-1 text-sm text-slate-500">
+                퇴직({input.retire[0]}년) 시점 가치로는 약 <b>{fmtWon(r.pensionAtRetirementValue)}</b>
+                <span className="text-xs"> — 공단 예상퇴직급여 조회의 표시 기준과 같은 시점입니다</span>
+              </p>
+            )}
             {range && (range.max - range.min > 1 || null) && (
               <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
                 군복무 소득 취급(미확정 2건)에 따라 <b>{fmtWon(range.min)} ~ {fmtWon(range.max)}</b> 범위로
@@ -515,6 +521,8 @@ function ResultPanel({
             </table>
           </div>
 
+          <BenefitOptions r={r} input={input} severance={severance} />
+
           <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
             <h3 className="font-semibold">적용된 파라미터</h3>
             <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -523,7 +531,11 @@ function ResultPanel({
               <Stat label="전체 3년 평균 (A)" value={fmtWon(r.A)} sub="개시시점 현재가치" />
               <Stat label="B/A (절사)" value={r.incomeRatio.toFixed(2)} />
               <Stat label="소득재분배 적용비율" value={pct(r.redistributionRate)} sub="부칙 제13조제2항" />
-              <Stat label="퇴직수당 (별도)" value={fmtWon(severance)} sub="퇴직 시점 명목 · 산입기간 제외" />
+              <Stat
+                label="기여금 납부 총액 (추정)"
+                value={fmtWon(r.totalContributions)}
+                sub="법 제67조 · 연도별 기여율 적용 · 산입기간 제외"
+              />
             </div>
             {edge && (
               <Callout tone="amber" className="mt-3">
@@ -547,6 +559,114 @@ function ResultPanel({
         </>
       )}
     </section>
+  )
+}
+
+/** 퇴직급여 종류별 비교 — 법 제43조. 셋 중 하나만 선택할 수 있고 퇴직수당은 별도다. */
+function BenefitOptions({
+  r,
+  input,
+  severance,
+}: {
+  r: PensionResult
+  input: PensionInput
+  severance: number
+}) {
+  const total = r.service.total
+  const maxPensionYears = Math.floor(total)
+  const [pensionYears, setPensionYears] = useState(10)
+  const canDeduct = total > 10
+  const py = Math.min(Math.max(pensionYears, 10), Math.max(10, maxPensionYears))
+  const deducted = canDeduct && py < total ? deductedOption(input, py) : null
+  const fullLump = retirementLumpSum(r.finalIncomeAtRetirement, total)
+  const retireYear = input.retire[0]
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h3 className="font-semibold">퇴직급여 종류별 비교</h3>
+      <p className="mt-0.5 text-xs text-slate-500">
+        셋 중 <b>하나만</b> 선택할 수 있으며, 선택 후 변경할 수 없습니다 (법 제43조). 퇴직수당은
+        선택과 무관하게 별도 지급됩니다.
+      </p>
+
+      <div className="mt-3 space-y-3">
+        <div className="rounded-lg border border-slate-200 p-3">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-sm font-medium">① 퇴직연금 (종신)</span>
+            <span className="font-semibold">월 {fmtWon(r.monthlyPension)}</span>
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            {r.startYear}년부터 사망 시까지 · 매년 물가연동 조정 · 퇴직({retireYear}년) 시점 가치로는
+            월 {fmtWon(r.pensionAtRetirementValue)}
+          </p>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 p-3">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-sm font-medium">② 퇴직일시금 (연금 포기)</span>
+            <span className="font-semibold">{fmtWon(fullLump)}</span>
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            퇴직({retireYear}년) 시 일시 수령 · 법 제43조제5항 산식 · 산정액이 기여금+민법 소정
+            이자보다 적으면 후자를 지급 (참고: 기여금 원금 추정 {fmtWon(r.totalContributions)})
+          </p>
+        </div>
+
+        {canDeduct && (
+          <div className="rounded-lg border border-slate-200 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-sm font-medium">③ 퇴직연금공제일시금 (절충)</span>
+              <label className="flex items-center gap-1.5 text-xs text-slate-600">
+                연금 선택 재직기간
+                <select
+                  className="rounded border border-slate-300 px-1.5 py-0.5 text-xs"
+                  value={py}
+                  onChange={(e) => setPensionYears(Number(e.target.value))}
+                >
+                  {Array.from({ length: maxPensionYears - 10 + 1 }, (_, i) => 10 + i).map((n) => (
+                    <option key={n} value={n}>
+                      {n}년
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            {deducted ? (
+              <>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+                  <div className="rounded bg-slate-50 p-2">
+                    <div className="text-xs text-slate-500">연금 ({r.startYear}년부터 종신)</div>
+                    <div className="font-semibold">월 {fmtWon(deducted.monthlyPension)}</div>
+                    <div className="text-xs text-slate-500">
+                      퇴직 시점 가치 월 {fmtWon(deducted.monthlyPensionAtRetirement)}
+                    </div>
+                  </div>
+                  <div className="rounded bg-slate-50 p-2">
+                    <div className="text-xs text-slate-500">
+                      일시금 (퇴직 시 · {deducted.deductedYears.toFixed(2)}년분)
+                    </div>
+                    <div className="font-semibold">{fmtWon(deducted.lumpSum)}</div>
+                  </div>
+                </div>
+                <p className="mt-1.5 text-xs text-slate-500">
+                  이른 재직기간 {py}년을 연금으로, 나머지를 일시금으로 환산한 추정입니다. 공단의
+                  실제 산정 방식과 차이가 있을 수 있습니다.
+                </p>
+              </>
+            ) : (
+              <p className="mt-2 text-xs text-slate-500">
+                전체 재직기간을 연금으로 선택한 상태입니다 (①과 동일).
+              </p>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-baseline justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2">
+          <span className="text-sm font-medium">퇴직수당 (공통 · 별도 지급)</span>
+          <span className="font-semibold">{fmtWon(severance)}</span>
+        </div>
+      </div>
+    </div>
   )
 }
 

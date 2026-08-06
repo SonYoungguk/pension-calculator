@@ -81,5 +81,23 @@ export interface PensionResult {
   realValueAtBaseYear: number
   /** 퇴직 시점 명목 기준소득월액 (퇴직수당·일시금 산정 기초) */
   finalIncomeAtRetirement: number
+  /** 월 연금액을 퇴직 시점 가치로 되돌린 금액 — 공단 예상퇴직급여 조회와 같은 기준 */
+  pensionAtRetirementValue: number
+  /** 재직 중 기여금 납부 총액 추정 (명목 합계, 산입기간 제외) — 법 제67조 */
+  totalContributions: number
   early: EarlyPension | null
+}
+
+/** 공제일시금 선택 결과 — 법 제43조제3항·제6항 */
+export interface DeductedOption {
+  /** 연금으로 받는 재직연수 */
+  pensionYears: number
+  /** 일시금으로 받는 재직연수 (공제재직연수) */
+  deductedYears: number
+  /** 감액된 월 연금액 (개시 시점) */
+  monthlyPension: number
+  /** 감액된 월 연금액 (퇴직 시점 가치) */
+  monthlyPensionAtRetirement: number
+  /** 공제일시금 (퇴직 시 수령, 명목) */
+  lumpSum: number
 }

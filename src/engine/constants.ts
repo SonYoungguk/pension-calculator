@@ -30,6 +30,16 @@ export const SEVERANCE_RATES: ReadonlyArray<readonly [number, number]> = [
 export const INCOME_CAP_MULTIPLE = 1.6
 /** 기여율 — 법 제67조제2항 (2020년 이후) */
 export const CONTRIBUTION_RATE = 0.09
+
+/** 연도별 기여율 — 2016~2020 단계 인상 (법률 제13387호 부칙) */
+export function contributionRate(year: number): number {
+  if (year <= 2015) return 0.07
+  if (year === 2016) return 0.08
+  if (year === 2017) return 0.0825
+  if (year === 2018) return 0.085
+  if (year === 2019) return 0.0875
+  return 0.09
+}
 /** 소득재분배가 적용되는 재직기간 상한 — 부칙 제13조제2항 단서 */
 export const REDISTRIBUTION_SERVICE_CAP = 30
 /** 퇴직수당 재직연수 상한 — 시행령 제58조제2항 */

@@ -3,13 +3,15 @@
 import averageIncome from '../data/averageIncome.json'
 import {
   accrualRatePct,
+  contributionRate,
   EARLY_REDUCTION,
   pensionStartAge,
   REDISTRIBUTION_SERVICE_CAP,
   serviceCapYears,
 } from './constants'
 import { redistributionRate, transitionRate, truncateRatio } from './lookup'
-import type { EarlyPension, PensionInput, PensionResult, YM } from './types'
+import { deductedLumpSum } from './severance'
+import type { DeductedOption, EarlyPension, PensionInput, PensionResult, YM } from './types'
 
 const AVG = averageIncome as Record<string, number>
 /** 평균액 고시 마지막 확보 연도 — 이후는 가정값으로 외삽 */
@@ -40,7 +42,15 @@ function splitPeriods(spans: ReadonlyArray<readonly [YM, YM]>): Segments {
   return seg
 }
 
-export function calculate(inp: PensionInput): PensionResult {
+export interface CalculateOptions {
+  /**
+   * 연금으로 받을 재직연수 제한 (퇴직연금공제일시금 선택 시) — 법 제43조제3항.
+   * 초과분(나중 재직기간부터)은 연금 산정에서 제외된다. 10년 이상이어야 한다.
+   */
+  pensionServiceYears?: number
+}
+
+export function calculate(inp: PensionInput, opts: CalculateOptions = {}): PensionResult {
   const { salaryGrowth: r, cpi: p, gradeStep, avgIncomeGrowth } = inp.assumptions
   const m = r + gradeStep // 기준소득월액 명목 성장률
 
@@ -83,21 +93,36 @@ export function calculate(inp: PensionInput): PensionResult {
   const redistRate = redistributionRate(incomeRatio)
   const C = B * redistRate
 
+  // ── 공제일시금 선택 시 연금 산정용 재직기간 절단 ──
+  // 연금은 이른 재직기간부터 채우고, 초과분(나중 기간)이 일시금으로 빠진다.
+  let pensionMonths = { ...seg }
+  if (opts.pensionServiceYears !== undefined) {
+    let remain = Math.round(opts.pensionServiceYears * 12)
+    const p1m = Math.min(seg.p1, remain)
+    remain -= p1m
+    const p2m = Math.min(seg.p2, remain)
+    remain -= p2m
+    pensionMonths = { p1: p1m, p2: p2m, p3: Math.min(seg.p3, remain) }
+  }
+
   // ── 구간별 급여 ──
   // 1기간: 재직 20년 미만 전제(MVP) → 평균보수월액 × 재직연수 × 2.5%
   //   ★법령 미확정: 군복무 산입분의 1기간 소득을 인정할지 (includeP1Income)
   const p1Base = inp.includeP1Income ? B : 0
-  const y1 = p1Base * (seg.p1 / 12) * 0.025
+  const y1 = p1Base * (pensionMonths.p1 / 12) * 0.025
   // 2기간: 평균기준소득월액 × 이행률 × 재직기간 × 1.9%
-  const y2 = B * ih * (seg.p2 / 12) * 0.019
+  const y2 = B * ih * (pensionMonths.p2 / 12) * 0.019
   // 3기간: 지급률은 재직 연도별로 각각 적용한다 (퇴직연도 지급률 일괄 적용 금지)
   let s3 = 0
-  for (let y = Math.max(2016, inp.hire[0]); y <= retireYear; y++) {
+  let p3Remain = pensionMonths.p3
+  for (let y = Math.max(2016, inp.hire[0]); y <= retireYear && p3Remain > 0; y++) {
     const lo = y === inp.hire[0] ? inp.hire[1] : 1
     const hi = y === retireYear ? inp.retire[1] : 12
-    s3 += ((hi - lo + 1) / 12) * ((accrualRatePct(y) - 1.0) / 100)
+    const take = Math.min(hi - lo + 1, p3Remain)
+    s3 += (take / 12) * ((accrualRatePct(y) - 1.0) / 100)
+    p3Remain -= take
   }
-  const p3Years = seg.p3 / 12
+  const p3Years = pensionMonths.p3 / 12
   const individual = B * ih * s3
   const redistributedPart = C * ih * Math.min(p3Years, REDISTRIBUTION_SERVICE_CAP) * 0.01
   const revised = individual + redistributedPart
@@ -106,6 +131,22 @@ export function calculate(inp: PensionInput): PensionResult {
   const capApplied = revised > oldRule
 
   const monthlyPension = y1 + y2 + y3
+
+  // ── 기여금 납부 총액 추정 — 법 제67조 (본무 기간만, 연도별 기여율 단계 적용) ──
+  // 각 연도 기준소득월액은 기준연도 값에서 명목 성장률로 추정한 근사치다.
+  let totalContributions = 0
+  {
+    let paid = 0
+    const payCap = cap * 12 // 기여금 납부기간 상한 = 재직기간 상한 (법 부칙 제24조)
+    for (let y = inp.hire[0]; y <= retireYear && paid < payCap; y++) {
+      const lo = y === inp.hire[0] ? inp.hire[1] : 1
+      const hi = y === retireYear ? inp.retire[1] : 12
+      const months = Math.min(hi - lo + 1, payCap - paid)
+      const income = inp.baseIncome * Math.pow(1 + m, y - inp.baseYear)
+      totalContributions += income * contributionRate(y) * months
+      paid += months
+    }
+  }
 
   // ── 조기퇴직연금 (법 제43조제2항) ──
   let early: EarlyPension | null = null
@@ -138,6 +179,25 @@ export function calculate(inp: PensionInput): PensionResult {
     gapYears,
     realValueAtBaseYear: monthlyPension / Math.pow(1 + p, startYear - inp.baseYear),
     finalIncomeAtRetirement: incomeAtRetire,
+    pensionAtRetirementValue: monthlyPension / Math.pow(1 + r, startYear - retireYear),
+    totalContributions,
     early,
+  }
+}
+
+/**
+ * 퇴직연금공제일시금 선택지 계산 — 재직기간 중 pensionYears만 연금으로 받고
+ * 나머지(나중 기간)는 일시금으로 받는다. pensionYears는 10 이상이어야 한다.
+ */
+export function deductedOption(inp: PensionInput, pensionYears: number): DeductedOption {
+  const full = calculate(inp)
+  const reduced = calculate(inp, { pensionServiceYears: pensionYears })
+  const deductedYears = Math.max(0, full.service.total - pensionYears)
+  return {
+    pensionYears,
+    deductedYears,
+    monthlyPension: reduced.monthlyPension,
+    monthlyPensionAtRetirement: reduced.pensionAtRetirementValue,
+    lumpSum: deductedLumpSum(full.finalIncomeAtRetirement, deductedYears),
   }
 }
