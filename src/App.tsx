@@ -3,6 +3,7 @@ import averageIncome from './data/averageIncome.json'
 import { calculate, deductedOption } from './engine/calculator'
 import { INCOME_CAP_MULTIPLE, accrualRatePct } from './engine/constants'
 import { REDISTRIBUTION_BRACKETS } from './engine/constants'
+import { netPension } from './engine/netPension'
 import { retirementLumpSum, severanceAllowance } from './engine/severance'
 import { estimateTeacherIncome, TEACHER_DEFAULTS, TEACHER_SALARY_YEAR } from './engine/teacherIncome'
 import type { PensionInput, PensionResult, YM } from './engine/types'
@@ -642,6 +643,8 @@ function ResultPanel({
             )}
           </div>
 
+          <NetPensionCard r={r} input={input} />
+
           <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
             <h3 className="font-semibold">재직기간 구간별 내역</h3>
             <p className="mt-0.5 text-xs text-slate-500">
@@ -718,6 +721,75 @@ function ResultPanel({
         </>
       )}
     </section>
+  )
+}
+
+/**
+ * 실수령액 추정 — 연금소득세 + 건강보험료(지역가입자).
+ * 미래 세법·보험료율은 알 수 없으므로 현행(2026년) 제도를 "기준연도 구매력 금액"에 적용한다
+ * (과표 구간이 장기적으로 물가를 따라간다는 가정 — 명목 금액에 적용하면 세금이 과대 추정된다).
+ */
+function NetPensionCard({ r, input }: { r: PensionResult; input: PensionInput }) {
+  const [dependent, setDependent] = useState(false)
+  const net = netPension(r.realValueAtBaseYear, dependent)
+  const inflate = Math.pow(1 + input.assumptions.cpi, r.startYear - input.baseYear)
+  const monthlyTax = (net.incomeTax + net.localTax) / 12
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="font-semibold">실수령액 추정 (현행 {input.baseYear}년 제도 기준)</h3>
+        <label className="flex items-center gap-1.5 text-xs text-slate-600">
+          <input type="checkbox" checked={dependent} onChange={(e) => setDependent(e.target.checked)} />
+          건강보험 피부양자 (보험료 없음)
+        </label>
+      </div>
+      <p className="mt-0.5 text-xs text-slate-500">
+        {input.baseYear}년 구매력 금액 기준. 과표 구간이 물가를 따라 조정된다고 가정합니다.
+      </p>
+      <table className="mt-3 w-full text-sm">
+        <tbody className="divide-y divide-slate-100">
+          <tr>
+            <td className="py-1.5">세전 연금 ({input.baseYear}년 구매력)</td>
+            <td className="py-1.5 text-right font-medium">{fmtWon(r.realValueAtBaseYear)}</td>
+          </tr>
+          <tr className="text-slate-600">
+            <td className="py-1.5">
+              소득세 + 지방소득세 (월환산)
+              <span className="ml-1 text-xs text-slate-400">
+                연금소득공제 {fmtWon(net.incomeDeduction)} · 과표 {fmtWon(net.taxBase)}/년
+              </span>
+            </td>
+            <td className="py-1.5 text-right">−{fmtWon(monthlyTax)}</td>
+          </tr>
+          <tr className="text-slate-600">
+            <td className="py-1.5">
+              건강보험료 (지역가입자)
+              <span className="ml-1 text-xs text-slate-400">연금소득의 50% × 7.09%</span>
+            </td>
+            <td className="py-1.5 text-right">−{fmtWon(net.healthInsurance)}</td>
+          </tr>
+          <tr className="text-slate-600">
+            <td className="py-1.5">장기요양보험료</td>
+            <td className="py-1.5 text-right">−{fmtWon(net.longTermCare)}</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr className="border-t border-slate-200 font-semibold">
+            <td className="py-2">월 실수령액 ({input.baseYear}년 구매력)</td>
+            <td className="py-2 text-right">{fmtWon(net.netMonthly)}</td>
+          </tr>
+        </tfoot>
+      </table>
+      <p className="mt-1 text-xs text-slate-500">
+        개시({r.startYear}년) 시점 명목으로는 약 {fmtWon(net.netMonthly * inflate)}
+      </p>
+      <Callout tone="amber" className="mt-2">
+        인적공제는 본인 기본공제(150만원)만 반영했고, 다른 소득·재산·자동차 부과분과 부양가족
+        공제는 포함하지 않은 추정입니다. 연금 외 소득이 있거나 재산이 많으면 실제 부담이
+        달라집니다.
+      </Callout>
+    </div>
   )
 }
 
