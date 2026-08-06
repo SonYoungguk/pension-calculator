@@ -1,0 +1,67 @@
+name: 연간 법령 데이터 갱신
+
+on:
+  schedule:
+    # 매년 2월 1일 — 공무원보수규정 개정(통상 1월) 반영
+    - cron: '0 0 1 2 *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  update-salary-table:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: 교원 봉급표 갱신 (인사혁신처 공식 페이지)
+        run: node scripts/update-salary-table.mjs
+
+      - name: 데이터 검증 (전체 테스트)
+        run: npm test
+
+      - name: 변경 시 PR 생성
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: auto/update-salary-table
+          title: '교원 봉급표 자동 갱신'
+          commit-message: |
+            교원 봉급표 자동 갱신 (인사혁신처 공식 페이지)
+
+            scripts/update-salary-table.mjs 실행 결과. 병합 전 원문 대조를 권장합니다.
+          body: |
+            인사혁신처 봉급표 페이지에서 올해 교원 봉급표(별표 11)를 가져왔습니다.
+
+            - [ ] 1·15·40호봉 값을 [공식 페이지](https://www.mpm.go.kr/mpm/info/resultPay/bizSalary/)와 대조했습니다
+            - [ ] 테스트가 통과했습니다 (워크플로우에서 자동 실행됨)
+
+            변경이 없으면 이 PR은 생성되지 않습니다.
+          labels: data-update
+
+      - name: 수동 갱신 알림 이슈 생성
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          YEAR=$(date +%Y)
+          TITLE="${YEAR}년 수동 데이터 갱신 확인"
+          if ! gh issue list --state all --search "\"$TITLE\" in:title" --json title --jq '.[].title' | grep -qx "$TITLE"; then
+            gh issue create --title "$TITLE" --body "$(cat <<'EOF'
+          매년 수동으로 확인·갱신해야 하는 값들입니다 (API 없음):
+
+          - [ ] **공무원보수인상률** — 인사혁신처 고시 (1월 25일까지 관보). `보수인상률_물가변동률_시계열.csv`
+          - [ ] **전년도 소비자물가변동률** — KOSIS. 같은 CSV의 물가·연금인상률 열
+          - [ ] **전체 공무원 기준소득월액 평균액** — 4월 30일까지 관보 고시. `전체공무원_기준소득월액_평균액.csv`
+          - [ ] 수당 단가 변경 여부 (교직·담임·보직·가족수당 등) — `src/engine/teacherIncome.ts`
+
+          갱신 후 `npm run convert-data && npm test` 실행, 통과하면 커밋.
+          EOF
+          )"
+          fi

@@ -4,6 +4,7 @@ import { calculate, deductedOption } from './engine/calculator'
 import { INCOME_CAP_MULTIPLE, accrualRatePct } from './engine/constants'
 import { REDISTRIBUTION_BRACKETS } from './engine/constants'
 import { retirementLumpSum, severanceAllowance } from './engine/severance'
+import { estimateTeacherIncome, TEACHER_DEFAULTS, TEACHER_SALARY_YEAR } from './engine/teacherIncome'
 import type { PensionInput, PensionResult, YM } from './engine/types'
 import { DEFAULT_ASSUMPTIONS } from './engine/types'
 
@@ -24,7 +25,15 @@ function parseYM(s: string): YM | null {
 interface FormState {
   hire: string
   retire: string
+  incomeMode: 'direct' | 'teacher'
   baseIncome: string
+  grade: string
+  homeroom: boolean
+  headTeacher: boolean
+  spouse: boolean
+  children: string
+  annualBonus: string
+  overtimeMonthly: string
   hasMilitary: boolean
   militaryFrom: string
   militaryTo: string
@@ -38,7 +47,15 @@ interface FormState {
 const INITIAL: FormState = {
   hire: '',
   retire: '',
+  incomeMode: 'direct',
   baseIncome: '',
+  grade: '15',
+  homeroom: false,
+  headTeacher: false,
+  spouse: false,
+  children: '0',
+  annualBonus: String(TEACHER_DEFAULTS.annualBonus),
+  overtimeMonthly: String(TEACHER_DEFAULTS.overtimeMonthly),
   hasMilitary: false,
   militaryFrom: '',
   militaryTo: '',
@@ -49,20 +66,28 @@ const INITIAL: FormState = {
   avgIncomeGrowth: (DEFAULT_ASSUMPTIONS.avgIncomeGrowth * 100).toString(),
 }
 
+/** 정근수당 산정용 근무연수 — 임용 후 경과 + 군복무 (근사) */
+function estimateServiceYears(hire: YM | null, militaryMonths: number): number {
+  if (!hire) return 10
+  return Math.max(0, BASE_YEAR - hire[0]) + militaryMonths / 12
+}
+
 type Built =
-  | { ok: true; input: PensionInput; incomeClamped: boolean }
+  | {
+      ok: true
+      input: PensionInput
+      incomeClamped: boolean
+      teacherEstimate: ReturnType<typeof estimateTeacherIncome> | null
+    }
   | { ok: false; errors: string[] }
 
 function buildInput(f: FormState): Built {
   const errors: string[] = []
   const hire = parseYM(f.hire)
   const retire = parseYM(f.retire)
-  const rawIncome = Number(f.baseIncome.replaceAll(',', ''))
 
   if (!hire) errors.push('임용 연월을 입력하세요.')
   if (!retire) errors.push('퇴직예정 연월을 입력하세요.')
-  if (!f.baseIncome || !Number.isFinite(rawIncome) || rawIncome <= 0)
-    errors.push('기준소득월액을 입력하세요.')
 
   if (hire && hire[0] < 2010)
     errors.push('2009년 이전 임용자는 지원하지 않습니다(평균보수월액 자료 필요 — 공단에 문의하세요).')
@@ -81,12 +106,37 @@ function buildInput(f: FormState): Built {
     else military = [from, to]
   }
 
+  // 소득: 직접 입력 또는 교원 호봉 기반 추정
+  let rawIncome = 0
+  let teacherEstimate: ReturnType<typeof estimateTeacherIncome> | null = null
+  if (f.incomeMode === 'teacher') {
+    const militaryMonths = military
+      ? (military[1][0] - military[0][0]) * 12 + (military[1][1] - military[0][1]) + 1
+      : 0
+    teacherEstimate = estimateTeacherIncome({
+      grade: Number(f.grade),
+      serviceYears: estimateServiceYears(hire, militaryMonths),
+      homeroom: f.homeroom,
+      headTeacher: f.headTeacher,
+      spouse: f.spouse,
+      children: Number(f.children),
+      annualBonus: Number(f.annualBonus) || 0,
+      overtimeMonthly: Number(f.overtimeMonthly) || 0,
+    })
+    rawIncome = teacherEstimate.monthlyIncome
+  } else {
+    rawIncome = Number(f.baseIncome.replaceAll(',', ''))
+    if (!f.baseIncome || !Number.isFinite(rawIncome) || rawIncome <= 0)
+      errors.push('기준소득월액을 입력하세요.')
+  }
+
   if (errors.length) return { ok: false, errors }
 
   const incomeClamped = rawIncome > INCOME_CAP
   return {
     ok: true,
     incomeClamped,
+    teacherEstimate,
     input: {
       birthYear: 0, // 출생연도는 아래에서 채운다
       hire: hire!,
@@ -184,12 +234,38 @@ export default function App() {
               </div>
             )}
             {built.ok && results?.kind === 'ok' && (
-              <ResultPanel
-                r={results.main}
-                range={results.range}
-                input={built.input}
-                incomeClamped={built.incomeClamped}
-              />
+              <div className="space-y-4">
+                {built.teacherEstimate && (
+                  <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <h3 className="text-sm font-semibold">추정 기준소득월액 (교원)</h3>
+                      <span className="font-semibold">{fmtWon(built.teacherEstimate.monthlyIncome)}</span>
+                    </div>
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-xs text-slate-600">항목별 내역</summary>
+                      <table className="mt-1.5 w-full text-xs">
+                        <tbody>
+                          {built.teacherEstimate.components.map((c) => (
+                            <tr key={c.label} className="border-t border-slate-100">
+                              <td className="py-1">
+                                {c.label}
+                                {c.note && <span className="ml-1 text-slate-400">({c.note})</span>}
+                              </td>
+                              <td className="py-1 text-right">{fmtWon(c.monthly)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </details>
+                  </div>
+                )}
+                <ResultPanel
+                  r={results.main}
+                  range={results.range}
+                  input={built.input}
+                  incomeClamped={built.incomeClamped}
+                />
+              </div>
             )}
           </div>
         </div>
@@ -297,7 +373,12 @@ function InputPanel({
       <fieldset className="rounded-lg border border-slate-200 p-3">
         <legend className="px-1 text-sm font-medium text-slate-700">소득 입력 방식</legend>
         <label className="flex items-start gap-2 text-sm">
-          <input type="radio" checked readOnly className="mt-0.5" />
+          <input
+            type="radio"
+            className="mt-0.5"
+            checked={f.incomeMode === 'direct'}
+            onChange={() => set({ incomeMode: 'direct' })}
+          />
           <span>
             기준소득월액 직접 입력 <span className="text-slate-500">(권장)</span>
             <span className="mt-0.5 block text-xs text-slate-500">
@@ -305,21 +386,99 @@ function InputPanel({
             </span>
           </span>
         </label>
-        <label className="mt-2 flex items-start gap-2 text-sm text-slate-400">
-          <input type="radio" disabled className="mt-0.5" />
-          <span>직급·호봉 기반 추정 (준비 중)</span>
+        <label className="mt-2 flex items-start gap-2 text-sm">
+          <input
+            type="radio"
+            className="mt-0.5"
+            checked={f.incomeMode === 'teacher'}
+            onChange={() => set({ incomeMode: 'teacher' })}
+          />
+          <span>
+            교원 호봉 기반 추정
+            <span className="mt-0.5 block text-xs text-slate-500">
+              유·초·중등 교원 봉급표({TEACHER_SALARY_YEAR}년) + 주요 수당으로 추정합니다
+            </span>
+          </span>
         </label>
-        <div className="mt-3">
-          <Field label={`기준소득월액 (${BASE_YEAR}년, 원)`} hint={`상한: 전체 공무원 평균액의 1.6배 = ${won.format(INCOME_CAP)}원`}>
-            <input
-              className={inputCls}
-              inputMode="numeric"
-              placeholder="4,300,000"
-              value={f.baseIncome}
-              onChange={(e) => set({ baseIncome: e.target.value.replace(/[^\d,]/g, '') })}
-            />
-          </Field>
-        </div>
+
+        {f.incomeMode === 'direct' ? (
+          <div className="mt-3">
+            <Field label={`기준소득월액 (${BASE_YEAR}년, 원)`} hint={`상한: 전체 공무원 평균액의 1.6배 = ${won.format(INCOME_CAP)}원`}>
+              <input
+                className={inputCls}
+                inputMode="numeric"
+                placeholder="4,300,000"
+                value={f.baseIncome}
+                onChange={(e) => set({ baseIncome: e.target.value.replace(/[^\d,]/g, '') })}
+              />
+            </Field>
+          </div>
+        ) : (
+          <div className="mt-3 space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="호봉">
+                <select className={inputCls} value={f.grade} onChange={(e) => set({ grade: e.target.value })}>
+                  {Array.from({ length: 40 }, (_, i) => i + 1).map((g) => (
+                    <option key={g} value={String(g)}>
+                      {g}호봉
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="자녀 수">
+                <select className={inputCls} value={f.children} onChange={(e) => set({ children: e.target.value })}>
+                  {[0, 1, 2, 3, 4].map((n) => (
+                    <option key={n} value={String(n)}>
+                      {n}명
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+              {(
+                [
+                  ['homeroom', '담임'],
+                  ['headTeacher', '보직교사(부장)'],
+                  ['spouse', '배우자 있음'],
+                ] as const
+              ).map(([key, label]) => (
+                <label key={key} className="flex items-center gap-1.5">
+                  <input type="checkbox" checked={f[key]} onChange={(e) => set({ [key]: e.target.checked })} />
+                  {label}
+                </label>
+              ))}
+            </div>
+            <details>
+              <summary className="cursor-pointer text-xs font-medium text-slate-600">
+                변동 수당 조정 (성과상여금·시간외근무)
+              </summary>
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                <Field label="성과상여금 (연, 원)">
+                  <input
+                    className={inputCls}
+                    inputMode="numeric"
+                    value={f.annualBonus}
+                    onChange={(e) => set({ annualBonus: e.target.value.replace(/\D/g, '') })}
+                  />
+                </Field>
+                <Field label="시간외근무 등 (월, 원)">
+                  <input
+                    className={inputCls}
+                    inputMode="numeric"
+                    value={f.overtimeMonthly}
+                    onChange={(e) => set({ overtimeMonthly: e.target.value.replace(/\D/g, '') })}
+                  />
+                </Field>
+              </div>
+            </details>
+            <p className="text-xs text-amber-700">
+              추정 모델입니다. 정근수당은 임용·군복무 기간에서 자동 계산되며, 실제 기준소득월액
+              산정 방식(개인 3개 보수를 직종 평균으로 대체)과 달라 오차가 있을 수 있습니다.
+              연금복지포털의 실제 값이 있으면 직접 입력을 쓰세요.
+            </p>
+          </div>
+        )}
       </fieldset>
 
       <fieldset className="rounded-lg border border-slate-200 p-3">
