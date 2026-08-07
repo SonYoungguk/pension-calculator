@@ -10,8 +10,17 @@ import type { PensionInput, PensionResult, YM } from './engine/types'
 import { DEFAULT_ASSUMPTIONS } from './engine/types'
 
 const AVG = averageIncome as Record<string, number>
-const BASE_YEAR = 2026
-const INCOME_CAP = AVG[BASE_YEAR] * INCOME_CAP_MULTIPLE
+/** 확보된 전체 평균액 고시의 마지막 연도 — 이후 연도는 평균액 인상률 가정으로 외삽 */
+const AVG_YEAR = 2026
+/** 교육공무원 정년 — 교육공무원법 제47조 (만 62세, 학기말 퇴직) */
+const TEACHER_RETIRE_AGE = 62
+
+/** 기준소득월액 법정 상한 (평균액 × 1.6배) — 기준연도가 미래면 가정 인상률로 외삽 */
+function incomeCapFor(baseYear: number, avgGrowth: number): number {
+  const avg =
+    baseYear > AVG_YEAR ? AVG[AVG_YEAR] * Math.pow(1 + avgGrowth, baseYear - AVG_YEAR) : AVG[baseYear]
+  return (avg ?? AVG[AVG_YEAR]) * INCOME_CAP_MULTIPLE
+}
 
 const won = new Intl.NumberFormat('ko-KR')
 const fmtWon = (v: number) => `${won.format(Math.round(v))}원`
@@ -28,6 +37,8 @@ interface FormState {
   retire: string
   incomeMode: 'direct' | 'teacher'
   baseIncome: string
+  /** 직접 입력한 기준소득월액이 어느 연도 값인지 */
+  baseYearSel: string
   grade: string
   homeroom: boolean
   headTeacher: boolean
@@ -50,6 +61,7 @@ const INITIAL: FormState = {
   retire: '',
   incomeMode: 'direct',
   baseIncome: '',
+  baseYearSel: String(AVG_YEAR),
   grade: '15',
   homeroom: false,
   headTeacher: false,
@@ -68,9 +80,9 @@ const INITIAL: FormState = {
 }
 
 /** 정근수당 산정용 근무연수 — 임용 후 경과 + 군복무 (근사) */
-function estimateServiceYears(hire: YM | null, militaryMonths: number): number {
+function estimateServiceYears(hire: YM | null, baseYear: number, militaryMonths: number): number {
   if (!hire) return 10
-  return Math.max(0, BASE_YEAR - hire[0]) + militaryMonths / 12
+  return Math.max(0, baseYear - hire[0]) + militaryMonths / 12
 }
 
 type Built =
@@ -108,6 +120,8 @@ function buildInput(f: FormState): Built {
   }
 
   // 소득: 직접 입력 또는 교원 호봉 기반 추정
+  // 기준연도 — 교원 모드는 봉급표 연도로 고정, 직접 입력은 사용자가 고른 연도
+  const baseYear = f.incomeMode === 'teacher' ? TEACHER_SALARY_YEAR : Number(f.baseYearSel) || AVG_YEAR
   let rawIncome = 0
   let teacherEstimate: ReturnType<typeof estimateTeacherIncome> | null = null
   if (f.incomeMode === 'teacher') {
@@ -116,7 +130,7 @@ function buildInput(f: FormState): Built {
       : 0
     teacherEstimate = estimateTeacherIncome({
       grade: Number(f.grade),
-      serviceYears: estimateServiceYears(hire, militaryMonths),
+      serviceYears: estimateServiceYears(hire, baseYear, militaryMonths),
       homeroom: f.homeroom,
       headTeacher: f.headTeacher,
       spouse: f.spouse,
@@ -133,7 +147,8 @@ function buildInput(f: FormState): Built {
 
   if (errors.length) return { ok: false, errors }
 
-  const incomeClamped = rawIncome > INCOME_CAP
+  const cap = incomeCapFor(baseYear, (Number(f.avgIncomeGrowth) || 0) / 100)
+  const incomeClamped = rawIncome > cap
   return {
     ok: true,
     incomeClamped,
@@ -142,8 +157,8 @@ function buildInput(f: FormState): Built {
       birthYear: 0, // 출생연도는 아래에서 채운다
       hire: hire!,
       retire: retire!,
-      baseIncome: Math.min(rawIncome, INCOME_CAP),
-      baseYear: BASE_YEAR,
+      baseIncome: Math.min(rawIncome, cap),
+      baseYear,
       military,
       includeP1Income: true,
       includeMilitaryInAvg: true,
@@ -178,6 +193,12 @@ export default function App() {
     const by = Number(birthYear)
     if (!/^\d{4}$/.test(birthYear) || by < 1940 || by > 2010)
       return { ok: false as const, errors: ['출생연도(4자리)를 입력하세요.'] }
+    // 교원 정년(만 62세): 3~8월생은 그해 8/31, 9~2월생은 다음 해 2월 말 퇴직
+    if (b.input.retire[0] > by + TEACHER_RETIRE_AGE + 1)
+      return {
+        ok: false as const,
+        errors: [`퇴직예정일이 교원 정년(만 ${TEACHER_RETIRE_AGE}세)을 넘습니다. ${by + TEACHER_RETIRE_AGE}년 8월 31일 또는 ${by + TEACHER_RETIRE_AGE + 1}년 2월 말이 정년퇴직일입니다.`],
+      }
     return { ...b, input: { ...b.input, birthYear: by } }
   }, [f, birthYear])
 
@@ -366,8 +387,24 @@ function InputPanel({
         <Field label="임용 연월">
           <YearMonthField value={f.hire} onChange={(v) => set({ hire: v })} yearFrom={2010} yearTo={2035} />
         </Field>
-        <Field label="퇴직예정 연월">
-          <YearMonthField value={f.retire} onChange={(v) => set({ retire: v })} yearFrom={2017} yearTo={2070} />
+        <Field
+          label="퇴직예정 연월"
+          hint={
+            /^\d{4}$/.test(birthYear)
+              ? `교원 정년(만 ${TEACHER_RETIRE_AGE}세) 기준 정년퇴직: ${Number(birthYear) + TEACHER_RETIRE_AGE}년 8월 31일(3~8월생) 또는 ${Number(birthYear) + TEACHER_RETIRE_AGE + 1}년 2월 말(9~2월생)`
+              : undefined
+          }
+        >
+          <YearMonthField
+            value={f.retire}
+            onChange={(v) => set({ retire: v })}
+            yearFrom={2017}
+            yearTo={
+              /^\d{4}$/.test(birthYear)
+                ? Math.min(2070, Number(birthYear) + TEACHER_RETIRE_AGE + 1)
+                : 2070
+            }
+          />
         </Field>
       </div>
 
@@ -403,8 +440,24 @@ function InputPanel({
         </label>
 
         {f.incomeMode === 'direct' ? (
-          <div className="mt-3">
-            <Field label={`기준소득월액 (${BASE_YEAR}년, 원)`} hint={`상한: 전체 공무원 평균액의 1.6배 = ${won.format(INCOME_CAP)}원`}>
+          <div className="mt-3 grid grid-cols-[2fr_3fr] gap-2">
+            <Field label="이 금액의 기준 연도" hint="연금복지포털에서 확인한 시점">
+              <select
+                className={inputCls}
+                value={f.baseYearSel}
+                onChange={(e) => set({ baseYearSel: e.target.value })}
+              >
+                {Array.from({ length: 15 }, (_, i) => AVG_YEAR + i).map((y) => (
+                  <option key={y} value={String(y)}>
+                    {y}년
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field
+              label="기준소득월액 (원)"
+              hint={`상한(평균액×1.6배${Number(f.baseYearSel) > AVG_YEAR ? ', 외삽' : ''}): ${won.format(Math.round(incomeCapFor(Number(f.baseYearSel) || AVG_YEAR, (Number(f.avgIncomeGrowth) || 0) / 100)))}원`}
+            >
               <input
                 className={inputCls}
                 inputMode="numeric"
